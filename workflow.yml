@@ -1,0 +1,598 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: An example of Job with manual approval
+Resources:
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: BatchExecutionPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'batch:SubmitJob'
+                  - 'batch:DescribeJobs'
+                  - 'logs:*'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'ses:SendEmail'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'states:GetActivityTask'
+                Resource: 'arn:aws:states:*:*:activity:ManualApproveActivity'
+  ApiExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com 
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: ApiExecutionPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'states:*'
+                Resource: '*'
+  SubmitJobFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt 
+        - LambdaExecutionRole
+        - Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          print('Loading function')
+          batch = boto3.client('batch')
+          def lambda_handler(event, context):
+              # Log the received event
+              print("Received event: " + json.dumps(event, indent=2))
+              # Get parameters for the SubmitJob call
+              # http://docs.aws.amazon.com/batch/latest/APIReference/API_SubmitJob.html
+              jobName = event['jobName']
+              jobQueue = event['jobQueue']
+              jobDefinition = event['jobDefinition']
+              # containerOverrides and parameters are optional
+              if event.get('containerOverrides'):
+                  containerOverrides = event['containerOverrides']
+              else:
+                  containerOverrides = {}
+              if event.get('parameters'):
+                  parameters = event['parameters']
+              else:
+                  parameters = {}
+
+              try:
+                  # Submit a Batch Job
+                  response = batch.submit_job(jobQueue=jobQueue, jobName=jobName, jobDefinition=jobDefinition,
+                                              containerOverrides=containerOverrides, parameters=parameters)
+                  # Log response from AWS Batch
+                  print("Response: " + json.dumps(response, indent=2))
+                  # Return the jobId
+                  jobId = response['jobId']
+                  return {
+                      'jobId': jobId
+                  }
+              except Exception as e:
+                  print(e)
+                  message = 'Error submitting Batch Job'
+                  print(message)
+                  raise Exception(message)
+      Runtime: python3.6
+      Timeout: '25'
+  CheckJobFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt 
+        - LambdaExecutionRole
+        - Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          print('Loading function')
+
+          batch = boto3.client('batch')
+
+          def lambda_handler(event, context):
+              # Log the received event
+              print("Received event: " + json.dumps(event, indent=2))
+              # Get jobId from the event
+              jobId = event['jobId']
+
+              try:
+                  # Call DescribeJobs
+                  response = batch.describe_jobs(jobs=[jobId])
+                  # Log response from AWS Batch
+                  print("Response: " + json.dumps(response, indent=2))
+                  # Return the jobtatus
+                  jobStatus = response['jobs'][0]['status']
+                  return jobStatus
+              except Exception as e:
+                  print(e)
+                  message = 'Error getting Batch Job status'
+                  print(message)
+                  raise Exception(message)
+      Runtime: python3.6
+      Timeout: '25'
+  SampleVPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: 10.0.0.0/16
+  SampleInternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+    DependsOn: SampleVPC
+  PublicRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    DependsOn:
+      - SampleVPC
+      - SampleVPCGatewayAttachment
+    Properties:
+      VpcId: !Ref SampleVPC
+  SampleVPCGatewayAttachment:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    DependsOn:
+      - SampleVPC
+      - SampleInternetGateway
+    Properties:
+      VpcId: !Ref SampleVPC
+      InternetGatewayId: !Ref SampleInternetGateway
+  SampleSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: A security group for region-agnostic Batch resources
+      VpcId: !Ref SampleVPC
+  SampleSubnet:
+    Type: 'AWS::EC2::Subnet'
+    DependsOn: SampleVPCGatewayAttachment
+    Properties:
+      CidrBlock: 10.0.0.0/24
+      VpcId: !Ref SampleVPC
+      MapPublicIpOnLaunch: 'True'
+  PublicRoute:
+    Type: 'AWS::EC2::Route'
+    DependsOn:
+      - PublicRouteTable
+      - SampleVPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref SampleInternetGateway
+  SampleSubnetRouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref SampleSubnet
+  SampleAWSBatchServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: batch.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole'
+  SampleIamInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Roles:
+        - !Ref SampleEcsInstanceRole
+  SampleEcsInstanceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2008-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - >-
+          arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+  SampleJobDefinition:
+    Type: 'AWS::Batch::JobDefinition'
+    Properties:
+      Type: container
+      ContainerProperties:
+        Image: !Join 
+          - ''
+          - - 137112412989.dkr.ecr.
+            - !Ref 'AWS::Region'
+            - '.amazonaws.com/amazonlinux:latest'
+        Vcpus: 2
+        Memory: 2000
+        Command:
+          - echo
+          - Hello world
+      RetryStrategy:
+        Attempts: 1
+  SampleJobQueue:
+    Type: 'AWS::Batch::JobQueue'
+    DependsOn:
+      - SampleComputeEnvironment
+    Properties:
+      Priority: 1
+      ComputeEnvironmentOrder:
+        - Order: 1
+          ComputeEnvironment: !Ref SampleComputeEnvironment
+  SampleComputeEnvironment:
+    Type: 'AWS::Batch::ComputeEnvironment'
+    DependsOn:
+      - SampleSubnet
+      - SampleSecurityGroup
+      - SampleIamInstanceProfile
+      - SampleAWSBatchServiceRole
+    Properties:
+      Type: MANAGED
+      ComputeResources:
+        Type: EC2
+        MinvCpus: 0
+        DesiredvCpus: 0
+        MaxvCpus: 64
+        InstanceTypes:
+          - optimal
+        Subnets:
+          - !Ref SampleSubnet
+        SecurityGroupIds:
+          - !Ref SampleSecurityGroup
+        InstanceRole: !Ref SampleIamInstanceProfile
+      ServiceRole: !Ref SampleAWSBatchServiceRole
+  StatesExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - !Sub 'states.${AWS::Region}.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: '*'
+  ManualApproveActivity:
+    Type: "AWS::StepFunctions::Activity"
+    Properties: 
+      Name: ManualApproveActivity
+  JobStatusPollerStateMachine:
+    Type: 'AWS::StepFunctions::StateMachine'
+    Properties:
+      DefinitionString: !Sub 
+        - |-
+          {
+            "Comment": "A state machine that submits a Job to AWS Batch and monitors the Job until it completes.",
+            "StartAt": "Submit Job",
+            "States": {
+              "Submit Job": {
+                "Type": "Task",
+                "Resource": "${submitJobArn}",
+                "ResultPath": "$.guid",
+                "Next": "Wait X Seconds"
+              },
+              "Wait X Seconds": {
+                "Type": "Wait",
+                "SecondsPath": "$.wait_time",
+                "Next": "Get Job Status"
+              },
+              "Get Job Status": {
+                "Type": "Task",
+                "Resource": "${checkJobArn}",
+                "Next": "Job Complete?",
+                "InputPath": "$.guid",
+                "ResultPath": "$.status"
+              },
+              "Job Complete?": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.status",
+                    "StringEquals": "FAILED",
+                    "Next": "Job Failed"
+                  },
+                  {
+                    "Variable": "$.status",
+                    "StringEquals": "SUCCEEDED",
+                    "Next": "Get Final Job Status"
+                  }
+                ],
+                "Default": "Wait X Seconds"
+              },
+              "Job Failed": {
+                "Type": "Fail",
+                "Cause": "AWS Batch Job Failed",
+                "Error": "DescribeJob returned FAILED"
+              },
+              "Get Final Job Status": {
+                "Type": "Task",
+                "Resource": "${checkJobArn}",
+                "InputPath": "$.guid",
+                "Next":"Manual Approve"
+              },
+              "Manual Approve": {
+                "Type": "Task",
+                "Resource": "${manualApproveActivityArn}",
+                "TimeoutSeconds": 3600,
+                "End": true
+              }
+            }
+          }
+        - submitJobArn: !GetAtt 
+            - SubmitJobFunction
+            - Arn
+          checkJobArn: !GetAtt 
+            - CheckJobFunction
+            - Arn
+          manualApproveActivityArn: !Ref ManualApproveActivity
+      RoleArn: !GetAtt 
+        - StatesExecutionRole
+        - Arn
+  MannualApproveActivityFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt 
+        - LambdaExecutionRole
+        - Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from urllib.parse import quote
+
+          print('Loading function')
+
+          client = boto3.client('ses')
+          step_functions = boto3.client('stepfunctions')
+          activityArn = os.environ.get("APPROVE_ACTIVITY_ARN")
+          recipient = os.environ.get("RECIPIENT")
+          sender = os.environ.get("SENDER")
+          apiUri = os.environ.get("API_URI")          
+
+          def lambda_handler(event, context):
+              try:
+                  activity_response = \
+                    step_functions.get_activity_task(
+                      activityArn=activityArn
+                    )
+                        
+                  task_token, input_ = activity_response['taskToken'], activity_response['input']
+                        
+                  print(f"Task token is {task_token}")
+                  print(f"Input is {input}")
+                  
+                  if not task_token:
+                      print("No activity found")
+                      return
+                  emailBody = """Hi!<br />
+                        Can you please approve job results:<br />
+                        {apiUri}succeed?taskToken={token}<br />
+                        Or reject:<br />
+                        {apiUri}fail?taskToken={token}""".format(apiUri=apiUri, token=quote(task_token))
+                  response = client.send_email(
+                        Destination={
+                            'ToAddresses': [
+                                recipient,
+                            ],
+                        },
+                        Message={
+                            'Body': {
+                                'Html': {
+                                    'Charset': 'UTF-8',
+                                    'Data': emailBody,
+                                }
+                            },
+                            'Subject': {
+                                'Charset': 'UTF-8',
+                                'Data': 'Your Approval Needed for Promotion!',
+                            },
+                        },
+                        Source=sender
+                    )
+                  # Return the jobtatus
+                  jobStatus = response['jobs'][0]['status']
+                  return jobStatus
+              except Exception as e:
+                  print(e)
+                  message = 'Error getting Batch Job status'
+                  print(message)
+                  raise Exception(message)
+      Runtime: python3.6
+      Timeout: '25'
+      Environment:
+        Variables:
+          APPROVE_ACTIVITY_ARN: !Ref ManualApproveActivity
+          RECIPIENT: "alytunenko@greenm.io"
+          SENDER: "alytunenko@greenm.io"
+          API_URI: !Join
+            - ''
+            - - 'https://'
+              - !Ref ManualApproveApi
+              - '.execute-api.'
+              - !Ref 'AWS::Region'
+              - '.amazonaws.com/respond/'
+  ManualApproveSchedule:
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "ManualApproveScheduledRule"
+      ScheduleExpression: "rate(10 minutes)"
+      State: "ENABLED"
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "MannualApproveActivityFunction"
+              - "Arn"
+          Id: "ManualApproveActivityTarget"
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: 
+        Ref: "MannualApproveActivityFunction"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "ManualApproveSchedule"
+          - "Arn"
+  ManualApproveApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ManualApproveApi
+      Description: A demo API to manually approve execution
+      Body: 
+        swagger: "2.0"
+        info:
+          version: "2018-08-07T13:09:18Z"
+          title: "hf-workflow-demo"
+        basePath: "/respond"
+        schemes:
+        - "https"
+        paths:
+          /fail:
+            get:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              parameters:
+              - name: "taskToken"
+                in: "query"
+                required: true
+                type: "string"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+              x-amazon-apigateway-request-validator: "Validate query string parameters and\
+                \ headers"
+              x-amazon-apigateway-integration:
+                credentials: !GetAtt
+                  - ApiExecutionRole
+                  - Arn
+                uri:  !Join
+                  - ''
+                  - - 'arn:aws:apigateway:'
+                    - !Ref 'AWS::Region'
+                    - ':states:action/SendTaskFailure'
+                responses:
+                  default:
+                    statusCode: "200"
+                requestTemplates:
+                  application/json: "{\r\n   \"cause\": \"Reject link was clicked.\",\r\n\
+                    \   \"error\": \"Rejected\",\r\n   \"taskToken\": \"$input.params('taskToken')\"\
+                    \r\n}"
+                passthroughBehavior: "when_no_templates"
+                httpMethod: "POST"
+                type: "aws"
+          /succeed:
+            get:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              parameters:
+              - name: "taskToken"
+                in: "query"
+                required: true
+                type: "string"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+              x-amazon-apigateway-request-validator: "Validate query string parameters and\
+                \ headers"
+              x-amazon-apigateway-integration:
+                credentials: !GetAtt
+                  - ApiExecutionRole
+                  - Arn
+                uri:  !Join
+                  - ''
+                  - - 'arn:aws:apigateway:'
+                    - !Ref 'AWS::Region'
+                    - ':states:action/SendTaskSuccess'
+                responses:
+                  default:
+                    statusCode: "200"
+                requestTemplates:
+                  application/json: "{\r\n   \"output\": \"\\\"Approve link was clicked.\\\
+                    \"\",\r\n   \"taskToken\": \"$input.params('taskToken')\"\r\n}"
+                passthroughBehavior: "when_no_templates"
+                httpMethod: "POST"
+                type: "aws"
+        definitions:
+          Empty:
+            type: "object"
+            title: "Empty Schema"
+        x-amazon-apigateway-request-validators:
+          Validate query string parameters and headers:
+            validateRequestParameters: true
+            validateRequestBody: false
+  ManualApproveApiDeployment: 
+    Type: AWS::ApiGateway::Deployment
+    Properties: 
+      RestApiId: 
+        Ref: "ManualApproveApi"
+      Description: "Respond deployment"
+      StageName: "respond"
+Outputs:
+  SampleComputeEnvironmentArn:
+    Value: !Ref SampleComputeEnvironment
+  SampleJobQueueArn:
+    Value: !Ref SampleJobQueue
+  SampleJobDefinition:
+    Value: !Ref SampleJobDefinition
+  StateMachineArn:
+    Value: !Ref JobStatusPollerStateMachine
+  ManualApproveActivityArn:
+    Value: !Ref ManualApproveActivity
+  ManualApproveApi:
+    Value: !Ref ManualApproveApi
+  ExecutionInput:
+    Description: Sample input to StartExecution.
+    Value: !Sub 
+      - |-
+        {
+          "jobName": "my-job",
+          "jobDefinition": "${jobDefinition}",
+          "jobQueue": "${jobQueue}",
+          "wait_time": 60
+        }
+      - jobDefinition: !Ref SampleJobDefinition
+        jobQueue: !Ref SampleJobQueue
