@@ -1,5 +1,14 @@
 AWSTemplateFormatVersion: 2010-09-09
 Description: An example of Job with manual approval
+Parameters: 
+  ManualApproveRecipient: 
+    Default: alytunenko@greenm.io
+    Description: Recipient of the manual approve e-mail
+    Type: String
+  ManualApproveSender: 
+    Default: alytunenko@greenm.io
+    Description: Sender of the manual approve e-mail
+    Type: String
 Resources:
   LambdaExecutionRole:
     Type: 'AWS::IAM::Role'
@@ -436,8 +445,8 @@ Resources:
       Environment:
         Variables:
           APPROVE_ACTIVITY_ARN: !Ref ManualApproveActivity
-          RECIPIENT: "alytunenko@greenm.io"
-          SENDER: "alytunenko@greenm.io"
+          RECIPIENT: !Ref ManualApproveRecipient
+          SENDER: !Ref ManualApproveSender
           API_URI: !Join
             - ''
             - - 'https://'
